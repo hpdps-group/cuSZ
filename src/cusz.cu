@@ -4,7 +4,7 @@
  * @brief Driver program of cuSZ.
  * @version 0.1
  * @date 2020-09-20
- * Created on 2019-12-30
+ * (created) 2019-12-30 (rev) 2022-02-20
  *
  * @copyright (C) 2020 by Washington State University, The University of Alabama, Argonne National Laboratory
  * See LICENSE in top-level directory
@@ -26,26 +26,18 @@
 
 using std::string;
 
+#include "../example/src/ex_common.cuh"
 #include "analysis/analyzer.hh"
-#include "argparse.hh"
-#include "capsule.hh"
+#include "common.hh"
+#include "context.hh"
+#include "default_path.cuh"
 #include "header.hh"
-#include "kernel/preprocess.cuh"
-#include "metadata.hh"
-#include "nvgpusz.cuh"
 #include "query.hh"
-#include "type_aliasing.hh"
-#include "types.hh"
 #include "utils.hh"
-
-// double expectedErr;
-// double actualAbsErr;
-// double actualRelErr;
-// string z_mode;
 
 namespace {
 
-template <typename Data>
+template <typename T>
 void check_shell_calls(string cmd_string)
 {
     char* cmd = new char[cmd_string.length() + 1];
@@ -53,125 +45,224 @@ void check_shell_calls(string cmd_string)
     int status = system(cmd);
     delete[] cmd;
     cmd = nullptr;
-    if (status < 0) { logging(log_err, "Shell command call failed, exit code: ", errno, "->", strerror(errno)); }
+    if (status < 0) { LOGGING(LOG_ERR, "Shell command call failed, exit code: ", errno, "->", strerror(errno)); }
 }
 
 }  // namespace
 
-/* gtest disabled in favor of code refactoring */
-// TEST(cuSZTest, TestMaxError)
-// {
-//     double actualErr = (z_mode == "r2r") ? actualRelErr : actualAbsErr;
-//     ASSERT_LE(actualErr, expectedErr);
-// }
-
-template <typename Data, int DownscaleFactor, int tBLK>
-Data* pre_binning(Data* d, size_t* dim_array)
+template <typename T, int DownscaleFactor, int tBLK>
+T* pre_binning(T* d, size_t* dim_array)
 {
     throw std::runtime_error("[pre_binning] disabled temporarily, will be part of preprocessing.");
     return nullptr;
 }
 
-#define NONPTR_TYPE(VAR) std::remove_pointer<decltype(VAR)>::type
+using T = float;
+using E = ErrCtrlTrait<2>::type;
+using P = FastLowPrecisionTrait<true>::type;
+
+void cli_dryrun(cuszCTX* ctx, bool dualquant = true)
+{
+    BaseCompressor<DefaultPath::DefaultBinding::PREDICTOR> analysis;
+
+    uint3        xyz{ctx->x, ctx->y, ctx->z};
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+
+    if (not dualquant) {
+        analysis.init_dualquant_dryrun(xyz);
+        analysis.dualquant_dryrun(ctx->fname.fname, ctx->eb, ctx->mode == "r2r", stream);
+        analysis.destroy_dualquant_dryrun();
+    }
+
+    if (dualquant) {
+        analysis.init_generic_dryrun(xyz);
+        analysis.generic_dryrun(ctx->fname.fname, ctx->eb, 512, ctx->mode == "r2r", stream);
+        analysis.destroy_generic_dryrun();
+    }
+    cudaStreamDestroy(stream);
+}
+
+template <class Compressor>
+void defaultpath_compress(
+    cuszCTX*                         ctx,
+    cudaStream_t                     stream,
+    Capsule<typename Compressor::T>* in_uncompressed,
+    std::string const                basename)
+{
+    using Predictor = typename Compressor::Predictor;
+    using SpReducer = typename Compressor::SpReducer;
+    using Codec     = typename Compressor::Codec;
+    using Header    = typename Compressor::HEADER;
+    using T         = typename Compressor::T;
+
+    auto autotune = [&]() -> int {
+        // TODO should be move to somewhere else, e.g., cusz::par_optmizer
+        if (ctx->on_off.autotune_huffchunk)
+            DefaultPath::DefaultBinding::CODEC::get_coarse_pardeg(ctx->data_len, ctx->huffman_chunksize, ctx->nchunk);
+        else
+            ctx->nchunk = ConfigHelper::get_npart(ctx->data_len, ctx->huffman_chunksize);
+
+        return ctx->nchunk;
+    };
+
+    BYTE*       compressed;
+    size_t      compressed_len;
+    std::string compressed_name = basename + ".cusza";
+
+    Capsule<BYTE> file("cusza");
+
+    int  radius = (*ctx).radius;
+    auto xyz    = dim3((*ctx).x, (*ctx).y, (*ctx).z);
+    auto pardeg = autotune();
+    auto data   = *in_uncompressed;
+
+    auto adjustd_eb = (*ctx).eb;
+    auto r2r        = (*ctx).mode == "r2r";
+    if (r2r) adjustd_eb *= data.prescan().get_rng();
+
+    Compressor compressor(xyz);
+    compressor.allocate_workspace(radius, pardeg);  // alpha: overallocate for decompresison
+
+    compressor.compress(data.dptr, adjustd_eb, radius, pardeg, compressed, compressed_len, stream);
+
+    file.set_len(compressed_len)
+        .template set<cusz::LOC::DEVICE>(compressed)
+        .template alloc<cusz::LOC::HOST>()
+        .device2host()
+        .to_file<cusz::LOC::HOST>(compressed_name)
+        .template free<cusz::LOC::HOST_DEVICE>();
+}
+
+template <class Compressor>
+void defaultpath_decompress(
+    typename Compressor::HEADER* header,
+    cudaStream_t                 stream,
+    Capsule<BYTE>*               in_compressed,
+    std::string const&           basename,
+    std::string const&           compare,
+    bool                         skip_write)
+{
+    using Header = typename Compressor::HEADER;
+    using T      = typename Compressor::T;
+
+    Capsule<T> xdata("xdata"), cmp("cmp");
+    auto       x = (*header).x, y = (*header).y, z = (*header).z;
+    auto       xyz    = dim3(x, y, z);
+    auto       len    = x * y * z;
+    auto       eb     = (*header).eb;
+    auto       radius = (*header).radius;
+    auto       pardeg = (*header).vle_pardeg;  // TODO don't really need pardeg in here
+
+    auto try_compare = [&]() {
+        if (compare != "") {
+            float gb = 1.0 * sizeof(T) * len / 1e9;
+            if (gb < 0.8) {
+                cmp.template alloc<cusz::LOC::HOST_DEVICE>().template from_file<cusz::LOC::HOST>(compare).host2device();
+                echo_metric_gpu(xdata.dptr, cmp.dptr, len);
+                cmp.template free<cusz::LOC::HOST_DEVICE>();
+            }
+            else {
+                cmp.template alloc<cusz::LOC::HOST>().template from_file<cusz::LOC::HOST>(compare);
+                xdata.device2host();
+                echo_metric_cpu(xdata.hptr, cmp.hptr, len);
+                cmp.template free<cusz::LOC::HOST>();
+            }
+        }
+    };
+
+    auto try_write = [&]() {
+        if (not skip_write)
+            xdata
+                .device2host()  //
+                .template to_file<cusz::LOC::HOST>(basename + ".cuszx");
+    };
+
+    xdata.set_len(len).template alloc<cusz::LOC::HOST_DEVICE, cusz::ALIGNDATA::SQUARE_MATRIX>();
+    cmp.set_len(len).set_name("origin-cmp");
+
+    Compressor compressor(xyz);
+    compressor.allocate_workspace(radius, pardeg);  // alpha: overallocate for decompresison
+    compressor.decompress((*in_compressed).dptr, eb, radius, xdata.dptr, stream);
+
+    try_compare();
+    try_write();
+}
+
+void defaultpath(cuszCTX* ctx)
+{
+    using T      = DefaultPath::DefaultCompressor::T;
+    using Header = DefaultPath::DefaultCompressor::HEADER;
+
+    cudaStream_t stream;
+    CHECK_CUDA(cudaStreamCreate(&stream));
+    Capsule<T> data("data");
+
+    auto basename = (*ctx).fname.fname;
+
+    if ((*ctx).task_is.dryrun) cli_dryrun(ctx);
+
+    if ((*ctx).task_is.construct) {  //
+        auto   len = (*ctx).x * (*ctx).y * (*ctx).z;
+        double time_loading{0.0};
+
+        Capsule<typename DefaultPath::DefaultCompressor::T> data;
+        data.set_len(len)
+            .template alloc<cusz::LOC::HOST_DEVICE, cusz::ALIGNDATA::SQUARE_MATRIX>()
+            .template from_file<cusz::LOC::HOST>(basename, &time_loading)
+            .host2device();
+
+        if ((*ctx).huff_bytewidth == 4)
+            defaultpath_compress<DefaultPath::DefaultCompressor>(ctx, stream, &data, basename);
+
+        if ((*ctx).huff_bytewidth == 8)
+            defaultpath_compress<DefaultPath::FallbackCompressor>(ctx, stream, &data, basename);
+    }
+
+    if ((*ctx).task_is.reconstruct) {
+        auto compressed_name = basename + ".cusza";
+        auto compressed_len  = ConfigHelper::get_filesize(compressed_name);
+        auto cmp_name        = (*ctx).fname.origin_cmp;
+
+        Capsule<BYTE> file;
+        file.set_len(compressed_len)
+            .template alloc<cusz::LOC::HOST_DEVICE>()
+            .template from_file<cusz::LOC::HOST>(compressed_name)
+            .host2device();
+
+        Header header;
+        memcpy(&header, file.hptr, sizeof(Header));
+
+        auto skip_write = (*ctx).to_skip.write2disk;
+
+        if (header.byte_vle == 4) {
+            defaultpath_decompress<DefaultPath::DefaultCompressor>(
+                &header, stream, &file, basename, cmp_name, skip_write);
+        }
+        if (header.byte_vle == 8) {
+            auto header_f = reinterpret_cast<DefaultPath::FallbackCompressor::HEADER*>(&header);
+            defaultpath_decompress<DefaultPath::FallbackCompressor>(
+                header_f, stream, &file, basename, cmp_name, skip_write);
+        }
+    }
+
+    if (stream) cudaStreamDestroy(stream);
+}
+
+void sparsitypath_spline3(cuszCTX* ctx)
+{
+    // TODO
+}
 
 int main(int argc, char** argv)
 {
-    auto ctx = new ArgPack();
-    ctx->parse_args(argc, argv);
+    auto ctx = new cuszCTX(argc, argv);
 
     if (ctx->verbose) {
         GetMachineProperties();
         GetDeviceProperty();
     }
 
-    // TODO remove hardcode for float for now
-    using Data = float;
-
-    auto len = ctx->data_len;
-    auto m   = static_cast<size_t>(ceil(sqrt(len)));
-    auto mxm = m * m;
-
-    Capsule<Data> in_data(mxm);
-
-    if (ctx->task_is.construct or ctx->task_is.dryrun) {
-        // logging(log_dbg, "add padding:", m, "units");
-
-        cudaMalloc(&in_data.dptr, in_data.nbyte());
-        cudaMallocHost(&in_data.hptr, in_data.nbyte());
-
-        {
-            auto a = hires::now();
-            io::read_binary_to_array<Data>(ctx->fnames.path2file, in_data.hptr, len);
-            auto z = hires::now();
-
-            if (ctx->verbose) logging(log_dbg, "time loading datum:", static_cast<duration_t>(z - a).count(), "sec");
-
-            logging(log_info, "load", ctx->fnames.path2file, len * sizeof(Data), "bytes");
-        }
-
-        in_data.h2d();
-
-        if (ctx->mode == "r2r") {
-            Analyzer analyzer;
-            auto     result = analyzer.GetMaxMinRng                                     //
-                          <Data, ExecutionPolicy::cuda_device, AnalyzerMethod::thrust>  //
-                          (in_data.dptr, len);
-            if (ctx->verbose) logging(log_dbg, "time scanning:", result.seconds, "sec");
-            ctx->eb *= result.rng;
-        }
-
-        if (ctx->verbose)
-            logging(
-                log_dbg, std::to_string(ctx->quant_nbyte) + "-byte quant type,",
-                std::to_string(ctx->huff_nbyte) + "-byte internal Huff type");
-    }
-
-    if (ctx->task_is.pre_binning) {
-        cerr << log_err
-             << "Binning is not working temporarily; we are improving end-to-end throughput by NOT touching "
-                "filesystem. (ver. 0.1.4)"
-             << endl;
-        exit(1);
-    }
-
-    if (ctx->task_is.construct or ctx->task_is.dryrun) {  // fp32 only for now
-
-        if (ctx->quant_nbyte == 1) {
-            if (ctx->huff_nbyte == 4)
-                cusz_compress<true, 4, 1, 4>(ctx, &in_data);
-            else
-                cusz_compress<true, 4, 1, 8>(ctx, &in_data);
-        }
-        else if (ctx->quant_nbyte == 2) {
-            if (ctx->huff_nbyte == 4)
-                cusz_compress<true, 4, 2, 4>(ctx, &in_data);
-            else
-                cusz_compress<true, 4, 2, 8>(ctx, &in_data);
-        }
-
-        // release memory
-        cudaFree(in_data.dptr), cudaFreeHost(in_data.hptr);
-    }
-
-    if (in_data.dptr) {
-        cudaFreeHost(in_data.dptr);  // TODO messy
-    }
-
-    if (ctx->task_is.reconstruct) {  // fp32 only for now
-
-        // TODO data ready outside Decompressor?
-
-        if (ctx->quant_nbyte == 1) {
-            if (ctx->huff_nbyte == 4)
-                cusz_decompress<true, 4, 1, 4>(ctx);
-            else if (ctx->huff_nbyte == 8)
-                cusz_decompress<true, 4, 1, 8>(ctx);
-        }
-        else if (ctx->quant_nbyte == 2) {
-            if (ctx->huff_nbyte == 4)
-                cusz_decompress<true, 4, 2, 4>(ctx);
-            else if (ctx->huff_nbyte == 8)
-                cusz_decompress<true, 4, 2, 8>(ctx);
-        }
-    }
+    if (ctx->str_predictor == "lorenzo") defaultpath(ctx);
+    if (ctx->str_predictor == "spline3") sparsitypath_spline3(ctx);
 }

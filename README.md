@@ -6,11 +6,14 @@ cuSZ: CUDA-Based Error-Bounded Lossy Compressor for Scientific Data
 cuSZ is a CUDA implementation of the world-widely used [SZ lossy compressor](https://github.com/szcompressor/SZ). It is the *first* error-bounded lossy compressor on GPUs for scientific data, which significantly improves SZ's throughput in GPU-based heterogeneous HPC systems. 
 This document introduces the installation and use of cuSZ on NVIDIA GPUs. 
 
-Our published papers cover the essential design and implementation, accessible via 
-- **PACT '20 cuSZ**, ([local copy](doc/PACT'20-cusz.pdf)), ([ACM open access](https://dl.acm.org/doi/10.1145/3410463.3414624)), or ([arXiv-2007.09625](https://arxiv.org/abs/2007.09625))
-- **CLUSTER '21 cuSZ+**, ([local copy](doc/CLUSTER'21-cusz+.pdf)), or ([arXiv-2105.12912](https://arxiv.org/abs/2105.12912)) 
-  - `doi` will be ready along with the inproceedings.
+Our published papers cover the essential design and implementation.
+- **PACT '20 cuSZ** 
+  - framework: fully parallelized prediction & error quantization ("construction"), GPU Huffman codec
+  - [local copy](doc/PACT'20-cusz.pdf), [ACM open access](https://dl.acm.org/doi/10.1145/3410463.3414624), [arXiv-2007.09625](https://arxiv.org/abs/2007.09625)
+- **CLUSTER '21 cuSZ+**
+  - enhancement: fully parallelized "reconstruction" of $N$-D partial-sum, sparsity-aware data reduction
   - We are working on integrating the sparsity-aware compression.
+  - [IEEEXplore](https://doi.ieeecomputersociety.org/10.1109/Cluster48925.2021.00047}), open accesses to be updated
 
 *Kindly note:* If you mention cuSZ in your paper, please cite using [these entries](https://github.com/szcompressor/cuSZ#citing-cusz).
 
@@ -33,7 +36,6 @@ Table of Contents
 - [set up](#set-up)
 - [use](#use)
   - [basic use](#basic-use)
-  - [advanced use](#advanced-use)
 - [hands-on examples](#hands-on-examples)
 - [FAQ](#faq)
 - [tested by our team](#tested-by-our-team)
@@ -45,43 +47,52 @@ Table of Contents
 
 # set up
 
-The requirements are listed below.
+Requirements:
 
-- NVIDIA GPU: Pascal, Volta, Turing, Ampere
-- cmake 3.18 onward
-- C++14 enabled compiler, GCC 7 onward; CUDA 9.2 onward (11.x is recommended)
+- NVIDIA GPU: Pascal, Volta, Turing, Ampere; CUDA 10 onward (11.x is recommended)
+- cmake 3.18 onward; C++14 enabled compiler, GCC 7 onward
+  - [Ninja build system](https://ninja-build.org) is recommended.
 
 <details>
 <summary>
-more details about build tools
+More details about build tools
 </summary>
 
-- The table below shows toolchain compatibility; please also refer to [our testbed list](./doc/testbed.md).
+- The table below shows the *tested* toolchain compatibility; please also refer to [our testbed list](./doc/testbed.md).
 - more reference: 1) [CUDA compilers](https://gist.github.com/ax3l/9489132), 2) [CUDA archs](https://arnon.dk/matching-sm-architectures-arch-and-gencode-for-various-nvidia-cards/). 
 
-|      |     |      |      |      |      |      |      |      |      |
-| ---- | --- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
-| gcc  | 7.x | 7.x  | 7.x  | 7.x  | 7.x  | 7.x  | 7.x  | 7.x  |      |
-|      |     | 8.x  | 8.x  | 8.x  | 8.x  | 8.x  | 8.x  | 8.x  |      |
-|      |     |      |      |      | 9.x  | 9.x  | 9.x  | 9.x  | 9.x  |
-| CUDA | 9.2 | 10.0 | 10.1 | 10.2 | 11.0 | 11.1 | 11.2 | 11.3 | 11.4 |
+|      |     |      |      |      |      |      |      |      |      |      |      |
+| ---- | --- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
+| gcc  | 7.x | 7.x  | 7.x  | 7.x  | 7.x  | 7.x  | 7.x  | 7.x  |      |      |      |
+|      |     | 8.x  | 8.x  | 8.x  | 8.x  | 8.x  | 8.x  | 8.x  | 8.x  | 8.x  |      |
+|      |     |      |      |      | 9.x  | 9.x  | 9.x  | 9.x  | 9.x  | 9.x  | 9.x  |
+| CUDA | 9.2 | 10.0 | 10.1 | 10.2 | 11.0 | 11.1 | 11.2 | 11.3 | 11.4 | 11.5 | 11.6 |
 
 </details>
 
 <br/>
 
-The instruction of compiling from source code are listed below.
-
+For CUDA 11.x, to compile,
 ```bash
 git clone https://github.com/szcompressor/cuSZ.git cusz && cd cusz
-chmod 755 ./build.py && ./build.py <target> <optional: build type>
+chmod +x ./build.py  ## `./build.py -h` for help
+./build.py -t TARGET [-T BUILD TYPE] [-b BACKEND]
 ```
 
-- For the maximum compatibility, use `./build.py compat`. 
-- For optimal compilation, use `./build.py <target> <optional: build type>`. 
-  - Target names other than `compat` include `p100`, `v100`, `a100` and general `pascal`, `turing`, `ampere`.
-  - Build types include `release` (default), `release-profile` (enabling `-lineinfo`) and `debug` (enabling `-G`).
-- `build.py` automatically builds and installs `cusz` binary to `<workspace>/bin`.
+For example, to build A100-specific binary, 
+```
+./build.py -t a100
+```
+
+- GPU targets include `a100`, `v100`, `p100`, `ampere`, `turing`, `pascal`
+  - For the maximum compatibility, use `-t compat`. 
+- Build types include `release` (default), `release-profile` (with `-lineinfo`) and `debug` (with `-G`).
+- Build system backends include `make` (default) and `ninja`
+- `build.py` installs `cusz` binary to `${CMAKE_SOURCE_DIR}/bin`.
+- `--purge` to clean up all the old builds.
+
+Caveat: CUDA 10 or earlier, `cub` of a historical version becomes dependency. After `git clone`, please use `git submodule update --init` to patch.
+
 
 <br/>
 
@@ -91,18 +102,18 @@ chmod 755 ./build.py && ./build.py <target> <optional: build type>
 Type `cusz` or `cusz -h` for instant instructions. We give a basic use below.
 
 ```bash
-## cusz -t <dtype> -m <mode> -e <error bound> -i <input> -l <size> -z (compression) --report time[,quality[,...]]
-./bin/cusz -t f32 -m r2r -e 1e-4 -i ./data/cesm-CLDHGH-3600x1800 -l 3600,1800 -z --report time
-## cusz -i <cusz archive> -x [--compare -i <origin>] (decompresion)
+## cusz -t <type> -m <mode> -e <error bound> -i <in> -l <len> -z (compress) --report time[,quality[,...]]
+./bin/cusz -t f32 -m r2r -e 1e-4 -i ./data/cesm-CLDHGH-3600x1800 -l 3600x1800 -z --report time
+## cusz -i <cusz archive> -x [--compare -i <origin>] (decompress)
 ./bin/cusz -i ./data/cesm-CLDHGH-3600x1800.cusza -x
 ./bin/cusz -i ./data/cesm-CLDHGH-3600x1800.cusza -x --compare ./data/cesm-CLDHGH-3600x1800 --report time,quality
 ```
 
-We use 1800-by-3600 (y-x order) CESM-ATM CLDHGH for demonstration, which is in preset and `-D cesm` can be alternatively used . Type `cusz` or `cusz -h` to look up the presets.
+<!-- We use 1800-by-3600 (y-x order) CESM-ATM CLDHGH for demonstration, which is in preset and `-D cesm` can be alternatively used . Type `cusz` or `cusz -h` to look up the presets. -->
 
-```bash
+<!-- ```bash
 cusz -t f32 -m r2r -e 1e-4 -i ./data/cesm-CLDHGH-3600x1800 --demo cesm -z
-```
+``` -->
 
 The following *essential* arguments are required,
 
@@ -110,7 +121,7 @@ The following *essential* arguments are required,
 - `-m` to specify error control mode from `abs` (absolute) and `r2r` (relative to value range)
 - `-e` to specify error bound
 - `-i` to specify input file
-- `-l <size>` to specify dimensions; alternatively `--demo <dataset>` to load predefined size
+- `-l <size>` to specify dimensions
 
 ## advanced use
 
@@ -169,7 +180,7 @@ dry-run mode
 
 ```bash
 # compress
-cusz -t f32 -m r2r -e 1e-4 -i ./data/cesm-CLDHGH-3600x1800 --demo cesm -z \
+cusz -t f32 -m r2r -e 1e-4 -i ./data/cesm-CLDHGH-3600x1800 -l 3600x1800 -z \
     --report time
 # decompress
 cusz -i ./data/cesm-CLDHGH-3600x1800.cusza -x --report time
@@ -189,7 +200,7 @@ cusz -i ./data/cesm-CLDHGH-3600x1800.cusza -x --compare ./data/cesm-CLDHGH-3600x
 ```bash
 mkdir data2 data3
 # output compressed data to `data2`
-cusz -t f32 -m r2r -e 1e-4 -i ./data/cesm-CLDHGH-3600x1800 --demo cesm -z --opath data2
+cusz -t f32 -m r2r -e 1e-4 -i ./data/cesm-CLDHGH-3600x1800 -l 3600x1800 -z --opath data2
 # output decompressed data to `data3`
 cusz -i ./data2/cesm-CLDHGH-3600x1800.cusza -x --opath data3
 ```
@@ -202,7 +213,7 @@ cusz -i ./data2/cesm-CLDHGH-3600x1800.cusza -x --opath data3
 </summary>
 
 ```bash
-cusz -t f32 -m r2r -e 1e-4 -i ./data/cesm-CLDHGH-3600x1800 --demo cesm -z \
+cusz -t f32 -m r2r -e 1e-4 -i ./data/cesm-CLDHGH-3600x1800 -l 3600x1800 -z \
     --config cap=256,quantbyte=1 \
     --report time
 ```
@@ -215,7 +226,7 @@ cusz -t f32 -m r2r -e 1e-4 -i ./data/cesm-CLDHGH-3600x1800 --demo cesm -z \
 </summary>
 
 ```bash
-cusz -t f32 -m r2r -e 1e-4 -i ./data/cesm-CLDHGH-3600x1800 --demo cesm -z \
+cusz -t f32 -m r2r -e 1e-4 -i ./data/cesm-CLDHGH-3600x1800 -l 3600x1800 -z \
     --config cap=256,quantbyte=1 \
     --skip huffman
 cusz -i ./data/cesm-CLDHGH-3600x1800.cusza -x
@@ -230,7 +241,7 @@ cusz -i ./data/cesm-CLDHGH-3600x1800.cusza -x
 
 ```bash
 # This works equivalently to decompress with `--origin /path/to/origin-datum`
-cusz -t f32 -m r2r -e 1e-4 -i ./data/cesm-CLDHGH-3600x1800 --demo cesm -r
+cusz -t f32 -m r2r -e 1e-4 -i ./data/cesm-CLDHGH-3600x1800 -l 3600x1800 -r
 ```
 
 </details>
@@ -375,10 +386,7 @@ limitations
 
 # citing cuSZ
 
-<details>
-<summary>
 PACT '20, cuSZ
-</summary>
 
 ```bibtex
 @inproceedings{cusz2020,
@@ -399,28 +407,24 @@ PACT '20, cuSZ
 }
 ```
 
-</details>
-
-<details>
-<summary>
 CLUSTER '21, cuSZ+
-</summary>
-
-`doi` to be updated; a *temporary* entry is listed below.
 
 ```bibtex
-@misc{cuszplus2021,
-      title = {cuSZ+: Optimizing Error-Bounded Lossy Compression for Scientific Data on GPUs}, 
-     author = {Jiannan Tian and Sheng Di and Xiaodong Yu and Cody Rivera and Kai Zhao and Sian Jin and Yunhe Feng and Xin Liang and Dingwen Tao and Franck Cappello},
+@INPROCEEDINGS {cuszplus2021,
+     author = {J. Tian and S. Di and X. Yu and C. Rivera and K. Zhao and S. Jin and Y. Feng and X. Liang and D. Tao and F. Cappello},
+  booktitle = {2021 IEEE International Conference on Cluster Computing (CLUSTER)},
+      title = {Optimizing Error-Bounded Lossy Compression for Scientific Data on GPUs},
        year = {2021},
-     eprint = {2105.12912},
-       note = {accepted by IEEE CLUSTER '21},
-archivePrefix = {arXiv},
- primaryClass = {cs.DC}
+      pages = {283-293},
+   keywords = {conferences;graphics processing units;computer architecture;cluster computing;reconstruction algorithms;throughput;encoding},
+        doi = {10.1109/Cluster48925.2021.00047},
+        url = {https://doi.ieeecomputersociety.org/10.1109/Cluster48925.2021.00047},
+  publisher = {IEEE Computer Society},
+    address = {Los Alamitos, CA, USA},
+      month = {sep}
 }
 ```
 
-</details>
 <br/>
 
 # acknowledgements
