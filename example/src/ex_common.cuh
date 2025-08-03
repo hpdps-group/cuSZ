@@ -16,53 +16,16 @@
 #include <experimental/random>
 #include <iostream>
 #include <string>
-using std::cerr;
-using std::cout;
-using std::endl;
-using std::string;
 
-#include "../../src/utils.hh"
+#include "analysis/verify.hh"
+#include "analysis/verify_gpu.cuh"
+#include "utils/err.hh"
+#include "utils/format.hh"
+#include "utils/io.hh"
+#include "utils/viewer.hh"
 
 using BYTE = uint8_t;
 using SIZE = size_t;
-
-#define PRINT_HEADER_ENTRY(SYM) \
-    printf("header::%-*s: %d\n", 20, "entry[" #SYM "]", (*header).entry[COMPONENT::HEADER::SYM]);
-
-template <typename T>
-void echo_metric_gpu(T* d1, T* d2, size_t len)
-{
-    stat_t stat;
-    verify_data_GPU<T>(&stat, d1, d2, len);
-    analysis::print_data_quality_metrics<T>(&stat, 0, true);
-}
-
-template <typename T>
-void echo_metric_cpu(T* _d1, T* _d2, size_t len, bool from_device = true)
-{
-    stat_t stat;
-    T*     d1;
-    T*     d2;
-    if (not from_device) {
-        d1 = _d1;
-        d2 = _d2;
-    }
-    else {
-        printf("allocating tmp space for CPU verification\n");
-        auto bytes = sizeof(T) * len;
-        cudaMallocHost(&d1, bytes);
-        cudaMallocHost(&d2, bytes);
-        cudaMemcpy(d1, _d1, bytes, cudaMemcpyDeviceToHost);
-        cudaMemcpy(d2, _d2, bytes, cudaMemcpyDeviceToHost);
-    }
-    analysis::verify_data<T>(&stat, d1, d2, len);
-    analysis::print_data_quality_metrics<T>(&stat, 0, false);
-
-    if (from_device) {
-        if (d1) cudaFreeHost(d1);
-        if (d2) cudaFreeHost(d2);
-    }
-}
 
 /**
  * @brief Fill array with random intergers.
@@ -122,11 +85,11 @@ void figure_out_eb(CAPSULE& data, double& eb, double& adjusted_eb, bool use_r2r)
 void BARRIER(cudaStream_t stream = nullptr)
 {
     if (not stream) {
-        CHECK_CUDA(cudaDeviceSynchronize());
+        CHECK_GPU(cudaDeviceSynchronize());
         printf("device sync'ed\n");
     }
     else {
-        CHECK_CUDA(cudaStreamSynchronize(stream));
+        CHECK_GPU(cudaStreamSynchronize(stream));
         printf("stream sync'ed\n");
     }
 }
@@ -142,12 +105,12 @@ void exp__prepare_data(
     UNCOMPRESSED** uncompressed_backup = nullptr)
 {
     auto bytes = len * sizeof(UNCOMPRESSED);
-    CHECK_CUDA(cudaMallocManaged(uncompressed, bytes));
-    CHECK_CUDA(cudaMemset(*uncompressed, 0x0, bytes));
+    CHECK_GPU(cudaMallocManaged(uncompressed, bytes));
+    CHECK_GPU(cudaMemset(*uncompressed, 0x0, bytes));
     gen_randint_array(*uncompressed, len, base_number, non_base_portion);
 
-    CHECK_CUDA(cudaMallocManaged(decompressed, bytes));
-    CHECK_CUDA(cudaMemset(*decompressed, 0x0, bytes));
+    CHECK_GPU(cudaMallocManaged(decompressed, bytes));
+    CHECK_GPU(cudaMemset(*decompressed, 0x0, bytes));
 
     if (destructive)
         if (not uncompressed_backup) throw std::runtime_error("Destructive runtime must have data backed up.");

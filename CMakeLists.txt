@@ -1,34 +1,49 @@
-cmake_minimum_required(VERSION 3.18)
+# select backend
+set(PSZ_BACKEND "CUDA" CACHE STRING "Select the desired backend: CUDA/cuda, HIP/hip and ONEAPI/1api.")
 
-project(cusz_asap CUDA CXX)
-set(CMAKE_CUDA_STANDARD 14)
-set(CMAKE_CXX_STANDARD 14)
+if(PSZ_BACKEND STREQUAL "CUDA" OR PSZ_BACKEND STREQUAL "cuda")
+  cmake_minimum_required(VERSION 3.18)
+  project(CUSZ LANGUAGES CUDA CXX C VERSION 0.10.0)
+elseif(PSZ_BACKEND STREQUAL "HIP" OR PSZ_BACKEND STREQUAL "hip")
+  cmake_minimum_required(VERSION 3.21)
+  project(HIPSZ LANGUAGES HIP CXX C VERSION 0.6.0)
+elseif(PSZ_BACKEND STREQUAL "ONEAPI" OR PSZ_BACKEND STREQUAL "oneapi" OR PSZ_BACKEND STREQUAL "1api")
+  cmake_minimum_required(VERSION 3.23)
+  project(DPSZ LANGUAGES CXX C VERSION 0.6.0)
+endif()
 
-## This is a feature as of cmake 3.18.
-## check `cmake --help-policy CMP0104` for more detail.
-## The maximum possible in compatibility can be set in CMakeLists.txt using
-## `set(CMAKE_CUDA_ARCHITECTURES 60 61 62 70 72 75 80 86)`.
-## For command line, use, for example `cmake -DCMAKE_CUDA_ARCHITECTURES="75" ..` 
-## to specify CUDA arch.
+# general cmake setup
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+option(BUILD_SHARED_LIBS "prefer shared libaries" ON)
 
-enable_language(CUDA)
+# log: debug and sanitize
+option(PSZ_LOG_DBG_MODE "enable debugging printing" OFF)
+option(PSZ_LOG_SANITIZE_MODE "enable sanitizing functions" OFF)
+option(PSZ_LOG_ENABLE_ALL "enable all (debugging, sanitizing)" OFF)
+include(cmake/logging.cmake)
 
-#include_directories(src)
-#include_directories(src/pSZ)
+# conditionally enable functionality
+option(PSZ_RESEARCH_HUFFBK_CUDA "(CUDA only) build research artifacts: create Huffman codebook on GPU" OFF)
+option(PSZ_REACTIVATE_THRUSTGPU "build previously thrust implemented functions" OFF)
 
-## TODO flag only add to a specific library, e.g. suppressing deprecation on CUDA10 cuSPARSE
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --extended-lambda --expt-relaxed-constexpr -Wno-deprecated-declarations")
+# example and testing
+option(PSZ_BUILD_EXAMPLES "build example codes" ON)
 
-set(LIB_TYPE STATIC)
+# pythhon binding
+option(PSZ_BUILD_PYBINDING "enable Python binding for specific backend" OFF)
 
-add_library(pq ${LIB_TYPE} src/wrapper/extrap_lorenzo.cu src/wrapper/interp_spline3.cu)
-add_library(argp ${LIB_TYPE} src/context.cc)
-add_library(sp ${LIB_TYPE} src/wrapper/csr11.cu)
-target_link_libraries(sp PUBLIC -lcusparse)
-add_library(huff ${LIB_TYPE} src/wrapper/huffman_parbook.cu src/wrapper/huffman_coarse.cu)
-target_link_libraries(huff PUBLIC -lcusparse -lcuda)
-set_target_properties(huff PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-add_library(nvgpusz ${LIB_TYPE} src/default_path.cu src/base_compressor.cu src/sp_path.cu)
+if(PSZ_BACKEND STREQUAL "CUDA" OR PSZ_BACKEND STREQUAL "cuda")
+  message("[psz::info] CUDA backend has been selected.")
+  include(cmake/cuda.cmake)
+elseif(PSZ_BACKEND STREQUAL "HIP" OR PSZ_BACKEND STREQUAL "hip")
+  message("[psz::info] HIP-ROCm backend has been selected.")
+  include(cmake/hip.cmake)
+elseif(PSZ_BACKEND STREQUAL "ONEAPI" OR PSZ_BACKEND STREQUAL "oneapi" OR PSZ_BACKEND STREQUAL "1api")
+  message("[psz::info] oneAPI backend has been selected.")
+  include(cmake/sycl.cmake)
+else()
+  message(FATAL_ERROR "Unsupported PSZ_BACKEND selected: ${PSZ_BACKEND}")
+endif()
 
-add_executable(cusz src/cusz.cu)
-target_link_libraries(cusz nvgpusz argp huff sp pq)
+# probe cmake configs regarding compilers
+include(cmake/probe.cmake)
